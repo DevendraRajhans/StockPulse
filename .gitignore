@@ -6,6 +6,7 @@ target/
 
 # Spring Boot
 *.log
+backend/src/main/resources/application.properties
 
 # Node
 node_modules/

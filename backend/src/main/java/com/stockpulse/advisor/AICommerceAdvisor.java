@@ -1,0 +1,247 @@
+package com.stockpulse.advisor;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.stockpulse.entity.Product;
+import com.stockpulse.entity.enums.TriggerReason;
+import com.stockpulse.repository.ProductRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import java.util.List;
+
+@Service
+public class AICommerceAdvisor implements CommerceAdvisor {
+    
+    private static final Logger logger = LoggerFactory.getLogger(AICommerceAdvisor.class);
+    
+    @Autowired
+    private LLMGateway llmGateway;
+    
+    @Autowired
+    private ProductRepository productRepository;
+    
+    @Autowired
+    private RuleBasedCommerceAdvisor ruleBasedAdvisor;
+    
+    private final ObjectMapper objectMapper;
+    
+    public AICommerceAdvisor() {
+        this.objectMapper = new ObjectMapper();
+    }
+    
+    @Override
+    public PricingRecommendation generatePricingRecommendation(Long productId, TriggerReason triggerReason) {
+        try {
+            Product product = productRepository.findById(productId)
+                    .orElseThrow(() -> new RuntimeException("Product not found: " + productId));
+            double categoryAverage = calculateCategoryAverageDemandVelocity(product.getCategory());
+            String prompt = buildPrompt(product, categoryAverage, triggerReason);
+            String llmResponse = llmGateway.callLLM(prompt);
+            AIResponse aiResponse = parseLLMResponse(llmResponse);
+            if (validatePricingResponse(aiResponse.getPricing(), product)) {
+                return new PricingRecommendation(
+                    aiResponse.getPricing().getRecommendedPrice(),
+                    aiResponse.getPricing().getDirection(),
+                    aiResponse.getPricing().getConfidence(),
+                    aiResponse.getPricing().getReasoning(),
+                    triggerReason
+                );
+            } else {
+                logger.warn("Invalid pricing recommendation from LLM, falling back to rule-based advisor");
+                return ruleBasedAdvisor.generatePricingRecommendation(productId, triggerReason);
+            }
+        } catch (Exception e) {
+            logger.error("Error generating AI pricing recommendation, falling back to rule-based: ", e);
+            return ruleBasedAdvisor.generatePricingRecommendation(productId, triggerReason);
+        }
+    }
+    
+    @Override
+    public ReorderRecommendation generateReorderRecommendation(Long productId, TriggerReason triggerReason) {
+        try {
+            Product product = productRepository.findById(productId)
+                    .orElseThrow(() -> new RuntimeException("Product not found: " + productId));
+            double categoryAverage = calculateCategoryAverageDemandVelocity(product.getCategory());
+            String prompt = buildPrompt(product, categoryAverage, triggerReason);
+            String llmResponse = llmGateway.callLLM(prompt);
+            AIResponse aiResponse = parseLLMResponse(llmResponse);
+            if (validateReorderResponse(aiResponse.getReorder(), product)) {
+                return new ReorderRecommendation(
+                    aiResponse.getReorder().getRecommendedQuantity(),
+                    aiResponse.getReorder().getConfidence(),
+                    aiResponse.getReorder().getReasoning(),
+                    triggerReason
+                );
+            } else {
+                logger.warn("Invalid reorder recommendation from LLM, falling back to rule-based advisor");
+                return ruleBasedAdvisor.generateReorderRecommendation(productId, triggerReason);
+            }
+        } catch (Exception e) {
+            logger.error("Error generating AI reorder recommendation, falling back to rule-based: ", e);
+            return ruleBasedAdvisor.generateReorderRecommendation(productId, triggerReason);
+        }
+    }
+    
+    private String buildPrompt(Product product, double categoryAverage, TriggerReason triggerReason) {
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("You are a commerce optimization assistant. Analyze the product data and provide ");
+        prompt.append("pricing and reorder recommendations in JSON format.\n\n");
+        prompt.append("Product Information:\n");
+        prompt.append("- Name: ").append(product.getName()).append("\n");
+        prompt.append("- SKU: ").append(product.getSku()).append("\n");
+        prompt.append("- Category: ").append(product.getCategory()).append("\n");
+        prompt.append("- Current Price: $").append(product.getPrice()).append("\n");
+        prompt.append("- Cost: $").append(product.getCost()).append("\n");
+        prompt.append("- Current Stock: ").append(product.getQuantity()).append("\n");
+        prompt.append("- Minimum Stock Level: ").append(product.getMinStockLevel()).append("\n");
+        prompt.append("- Demand Velocity: ").append(product.getDemandVelocity()).append("\n");
+        prompt.append("- Category Average Demand Velocity: ").append(String.format("%.2f", categoryAverage)).append("\n");
+        prompt.append("- Trigger Reason: ").append(triggerReason).append("\n\n");
+        if (triggerReason == TriggerReason.INVENTORY_LOW) {
+            prompt.append("INVENTORY_LOW Trigger Analysis:\n");
+            prompt.append("- The current inventory (").append(product.getQuantity()).append(") is below the minimum threshold (")
+                  .append(product.getMinStockLevel()).append(").\n");
+            prompt.append("- Consider protecting inventory by adjusting pricing and calculating appropriate reorder quantity.\n");
+            prompt.append("- Balance supply protection with commercial reasonableness.\n\n");
+        } else if (triggerReason == TriggerReason.DEMAND_SPIKE) {
+            prompt.append("DEMAND_SPIKE Trigger Analysis:\n");
+            prompt.append("- The demand velocity (").append(product.getDemandVelocity()).append(") is significantly above the category average (")
+                  .append(String.format("%.2f", categoryAverage)).append(").\n");
+            prompt.append("- Capitalize on increased demand while maintaining commercially reasonable pricing.\n");
+            prompt.append("- Consider replenishment quantities that account for sustained high demand.\n\n");
+        }
+        prompt.append("Provide your response in the following JSON format ONLY:\n");
+        prompt.append("{\n");
+        prompt.append("  \"pricing\": {\n");
+        prompt.append("    \"recommendedPrice\": 0.0,\n");
+        prompt.append("    \"direction\": \"INCREASE|DECREASE|HOLD\",\n");
+        prompt.append("    \"confidence\": 0.0,\n");
+        prompt.append("    \"reasoning\": \"...\"\n");
+        prompt.append("  },\n");
+        prompt.append("  \"reorder\": {\n");
+        prompt.append("    \"recommendedQuantity\": 0,\n");
+        prompt.append("    \"confidence\": 0.0,\n");
+        prompt.append("    \"reasoning\": \"...\"\n");
+        prompt.append("  }\n");
+        prompt.append("}\n\n");
+        prompt.append("Important Guidelines:\n");
+        prompt.append("- recommendedPrice must be greater than 0\n");
+        prompt.append("- confidence must be between 0.0 and 1.0\n");
+        prompt.append("- direction must be one of: INCREASE, DECREASE, HOLD\n");
+        prompt.append("- recommendedQuantity must be a positive integer\n");
+        prompt.append("- Do not include any markdown formatting or code fences\n");
+        prompt.append("- Return ONLY the JSON structure as specified above\n");
+        return prompt.toString();
+    }
+    
+    private AIResponse parseLLMResponse(String response) throws Exception {
+        try {
+            return objectMapper.readValue(response, AIResponse.class);
+        } catch (Exception e) {
+            logger.warn("Failed to parse LLM response directly, trying to extract JSON from text: {}", response);
+            String jsonContent = extractJsonFromResponse(response);
+            return objectMapper.readValue(jsonContent, AIResponse.class);
+        }
+    }
+    private String extractJsonFromResponse(String response) {
+        int firstBrace = response.indexOf('{');
+        int lastBrace = response.lastIndexOf('}');
+        if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
+            return response.substring(firstBrace, lastBrace + 1);
+        }
+        return response;
+    }
+    
+    private boolean validatePricingResponse(PricingData pricingData, Product product) {
+        if (pricingData == null) return false;
+        if (pricingData.getRecommendedPrice() == null || pricingData.getRecommendedPrice().compareTo(java.math.BigDecimal.ZERO) <= 0) {
+            logger.warn("Invalid recommended price: {}", pricingData.getRecommendedPrice());
+            return false;
+        }
+        if (pricingData.getConfidence() == null || pricingData.getConfidence() < 0.0 || pricingData.getConfidence() > 1.0) {
+            logger.warn("Invalid confidence: {}", pricingData.getConfidence());
+            return false;
+        }
+        if (pricingData.getDirection() == null || 
+            (!"INCREASE".equals(pricingData.getDirection()) && 
+             !"DECREASE".equals(pricingData.getDirection()) && 
+             !"HOLD".equals(pricingData.getDirection()))) {
+            logger.warn("Invalid direction: {}", pricingData.getDirection());
+            return false;
+        }
+        java.math.BigDecimal currentPrice = product.getPrice();
+        java.math.BigDecimal recommendedPrice = pricingData.getRecommendedPrice();
+        java.math.BigDecimal priceChangePercent = recommendedPrice.subtract(currentPrice)
+                .abs()
+                .divide(currentPrice, 2, java.math.RoundingMode.HALF_UP)
+                .multiply(java.math.BigDecimal.valueOf(100));
+        if (priceChangePercent.compareTo(java.math.BigDecimal.valueOf(50)) > 0) {
+            logger.warn("Unreasonable price change detected: {}% from ${} to ${}", 
+                       priceChangePercent, currentPrice, recommendedPrice);
+        }
+        return true;
+    }
+    
+    private boolean validateReorderResponse(ReorderData reorderData, Product product) {
+        if (reorderData == null) return false;
+        if (reorderData.getRecommendedQuantity() == null || reorderData.getRecommendedQuantity() <= 0) {
+            logger.warn("Invalid recommended quantity: {}", reorderData.getRecommendedQuantity());
+            return false;
+        }
+        if (reorderData.getConfidence() == null || reorderData.getConfidence() < 0.0 || reorderData.getConfidence() > 1.0) {
+            logger.warn("Invalid confidence: {}", reorderData.getConfidence());
+            return false;
+        }
+        if (reorderData.getRecommendedQuantity() > 10000) {
+            logger.warn("Unreasonable reorder quantity detected: {}", reorderData.getRecommendedQuantity());
+        }
+        return true;
+    }
+    
+    private double calculateCategoryAverageDemandVelocity(String category) {
+        List<Product> productsInCategory = productRepository.findByCategory(category);
+        if (productsInCategory.isEmpty()) return 0.0;
+        double sum = productsInCategory.stream().mapToDouble(Product::getDemandVelocity).sum();
+        return sum / productsInCategory.size();
+    }
+    // Inner classes for JSON parsing
+    public static class AIResponse {
+        private PricingData pricing;
+        private ReorderData reorder;
+        
+        public PricingData getPricing() { return pricing; }
+        public void setPricing(PricingData pricing) { this.pricing = pricing; }
+        public ReorderData getReorder() { return reorder; }
+        public void setReorder(ReorderData reorder) { this.reorder = reorder; }
+    }
+    
+    public static class PricingData {
+        private java.math.BigDecimal recommendedPrice;
+        private String direction;
+        private Double confidence;
+        private String reasoning;
+        
+        public java.math.BigDecimal getRecommendedPrice() { return recommendedPrice; }
+        public void setRecommendedPrice(java.math.BigDecimal recommendedPrice) { this.recommendedPrice = recommendedPrice; }
+        public String getDirection() { return direction; }
+        public void setDirection(String direction) { this.direction = direction; }
+        public Double getConfidence() { return confidence; }
+        public void setConfidence(Double confidence) { this.confidence = confidence; }
+        public String getReasoning() { return reasoning; }
+        public void setReasoning(String reasoning) { this.reasoning = reasoning; }
+    }
+    
+    public static class ReorderData {
+        private Integer recommendedQuantity;
+        private Double confidence;
+        private String reasoning;
+        
+        public Integer getRecommendedQuantity() { return recommendedQuantity; }
+        public void setRecommendedQuantity(Integer recommendedQuantity) { this.recommendedQuantity = recommendedQuantity; }
+        public Double getConfidence() { return confidence; }
+        public void setConfidence(Double confidence) { this.confidence = confidence; }
+        public String getReasoning() { return reasoning; }
+        public void setReasoning(String reasoning) { this.reasoning = reasoning; }
+    }
+}
